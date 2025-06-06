@@ -13,8 +13,7 @@ use alloc::boxed::Box;
 use core::ptr::NonNull;
 use core::ops::Deref;
 
-
-use embedded::gc::{Heap, Gc, MyData};
+use embedded::gc::{Gc, Heap, MyData, RootGuard};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -28,44 +27,62 @@ fn main() -> ! {
         ALLOCATOR.lock().init(HEAP_MEMORY.as_ptr() as *mut u8, HEAP_SIZE);
     }
 
-    let mut heap = Heap::new();
-
-    // Allocate some GC objects
-    let root1 = heap.allocate(MyData {
-        value: 100,
-        child: None,
-    });
-
-    let root2 = heap.allocate(MyData {
-        value: 200,
-        child: Some(root1),
-    });
-
-    // Print values before GC
-    unsafe {
-        let data1 = root1.as_any().downcast_ref::<MyData>().unwrap();
-        hprintln!("root1 value = {}", data1.value);
-
-        let data2 = root2.as_any().downcast_ref::<MyData>().unwrap();
-        hprintln!("root2 value = {}", data2.value);
-
-        if let Some(child) = &data2.child {
-            let child_data = child.deref().as_any().downcast_ref::<MyData>().unwrap();
-            hprintln!("root2 child value = {}", child_data.value);
-        }
-    }
-
-    // Collect garbage with both roots alive
-    heap.collect_garbage(&[root1.as_non_null(), root2.as_non_null()]);
-
-    // Simulate dropping root2 by collecting garbage with only root1 as root
-    heap.collect_garbage(&[root1.as_non_null()]);
-
-    // Print values after GC
-    unsafe {
-        let data1 = root1.deref().as_any().downcast_ref::<MyData>().unwrap();
-        hprintln!("After GC, root1 value = {}", data1.value);
-    }
+    run_example();
 
     loop {}
+}
+
+/// Demonstrates tracing GC behavior with RAII root registration
+use core::cell::RefCell;
+
+fn run_example() {
+    let heap = RefCell::new(Heap::new());
+
+    // Allocate root1 and keep it rooted
+    {
+        let mut heap_ref = heap.borrow_mut();
+        let root1 = heap_ref.allocate(MyData {
+            value: 100,
+            child: None,
+        });
+        let _guard1 = RootGuard::new(&mut *heap_ref, root1);
+
+        {
+            let mut heap_ref = heap.borrow_mut();
+            let root2 = heap_ref.allocate(MyData {
+                value: 200,
+                child: Some(root1),
+            });
+            let _guard2 = RootGuard::new(&mut *heap_ref, root2);
+
+            unsafe {
+                let data1 = root1.deref().as_any().downcast_ref::<MyData>().unwrap();
+                let data2 = root2.deref().as_any().downcast_ref::<MyData>().unwrap();
+
+                hprintln!("root1 value = {}", data1.value);
+                hprintln!("root2 value = {}", data2.value);
+
+                if let Some(child) = &data2.child {
+                    let child_data = child.deref().as_any().downcast_ref::<MyData>().unwrap();
+                    hprintln!("root2 child value = {}", child_data.value);
+                }
+            }
+
+            // Collect GC with both roots alive
+            hprintln!("Collecting GC with root1 and root2");
+            let roots = heap.borrow().roots.borrow().clone();
+            heap.borrow_mut().collect_garbage(&roots);
+            // _guard2 drops here
+        }
+
+        // Now only root1 is rooted
+        hprintln!("Collecting GC with only root1");
+        let roots = heap.borrow().roots.borrow().clone();
+        heap.borrow_mut().collect_garbage(&roots);
+
+        unsafe {
+            let data1 = root1.deref().as_any().downcast_ref::<MyData>().unwrap();
+            hprintln!("After GC, root1 value = {}", data1.value);
+        }
+    }
 }
